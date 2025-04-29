@@ -453,6 +453,8 @@ func (rf *Raft) ticker() {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 	rf := &Raft{}
+	rf.mu.Lock()
+
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
@@ -460,12 +462,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (3A, 3B, 3C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.logs = []LogEntry{LogEntry{Term: 0}}
+	rf.logs = []LogEntry{{Term: 0}}
 
 	rf.toFollower(0)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	rf.mu.Unlock()
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
