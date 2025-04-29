@@ -52,7 +52,7 @@ type Raft struct {
 	matchIndex []int
 
 	state        uint8
-	heartbeatCh  chan struct{}
+	appendCh     chan struct{}
 	toFollowerCh chan struct{}
 	toLeaderCh   chan struct{}
 	grantVoteCh  chan struct{}
@@ -61,12 +61,8 @@ type Raft struct {
 	electionTimeout time.Duration
 }
 
-type LogEntry struct {
-	Term int
-}
-
 func (rf *Raft) resetChannels() {
-	rf.heartbeatCh = make(chan struct{})
+	rf.appendCh = make(chan struct{})
 	rf.toFollowerCh = make(chan struct{})
 	rf.toLeaderCh = make(chan struct{})
 	rf.grantVoteCh = make(chan struct{})
@@ -99,6 +95,9 @@ func (rf *Raft) toCandidate() {
 }
 
 func (rf *Raft) toLeader() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	if rf.state != CANDIDATE {
 		panic("Only candidates can become leaders")
 	}
@@ -215,20 +214,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	DPrintf("[%d] Server %d received AppendEntries from server %d\n", rf.currentTerm, rf.me, args.LeaderId)
 
-	reply.Term = rf.currentTerm
-	reply.Success = false
-
 	if args.Term < rf.currentTerm {
 		DPrintf("[%d] Server %d rejects AppendEntries from server %d, current term: %d, leader term: %d\n", rf.currentTerm, rf.me, args.LeaderId, rf.currentTerm, args.Term)
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
 	}
 
 	if args.Term > rf.currentTerm {
 		rf.toFollower(args.Term)
 	}
 
-	rf.leaderId = args.LeaderId
-
-	sendToChannel(rf.heartbeatCh)
+	sendToChannel(rf.appendCh)
 
 	reply.Success = true
 }
@@ -245,14 +242,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	// Your code here (3B).
+	if rf.state != LEADER {
+		DPrintf("[%d] Server %d is not a leader, cannot start command\n", rf.currentTerm, rf.me)
+		return -1, rf.currentTerm, false
+	}
 
-	return index, term, isLeader
+	term = rf.currentTerm
+	index = len(rf.logs) - 1
+
+	rf.logs = append(rf.logs, LogEntry{Term: term, Command: command})
+	rf.matchIndex[rf.me] = index
+	rf.nextIndex[rf.me] = index + 1
+
+	go rf.broadcastAppend()
+
+	return index, term, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -351,7 +359,7 @@ func (rf *Raft) startElection(fromState uint8) {
 	}()
 }
 
-func (rf *Raft) sendHeartbeat() {
+func (rf *Raft) broadcastAppend() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -364,7 +372,7 @@ func (rf *Raft) sendHeartbeat() {
 
 	rf.lastPing = time.Now()
 
-	heartbeatChan := make(chan AppendEntriesReply, len(rf.peers)-1)
+	appendChan := make(chan AppendEntriesReply, len(rf.peers)-1)
 
 	for i := range rf.peers {
 		if i != rf.me {
@@ -380,15 +388,18 @@ func (rf *Raft) sendHeartbeat() {
 
 				reply := AppendEntriesReply{}
 				DPrintf("[%d] Server %d sends heartbeat to server %d\n", rf.currentTerm, rf.me, i)
-				rf.sendAppendEntries(i, &args, &reply)
-				heartbeatChan <- reply
+
+				ok := rf.sendAppendEntries(i, &args, &reply)
+				if ok {
+					appendChan <- reply
+				}
 			}(i)
 		}
 	}
 
 	go func() {
 		for range rf.peers {
-			reply := <-heartbeatChan
+			reply := <-appendChan
 			rf.mu.Lock()
 			if reply.Term > rf.currentTerm {
 				rf.toFollower(reply.Term)
@@ -414,18 +425,15 @@ func (rf *Raft) ticker() {
 			case <-rf.toFollowerCh:
 				DPrintf("[%d] Server %d from leader to follower\n", rf.currentTerm, rf.me)
 			case <-time.After(heartbeatInterval):
-				// Send heartbeats to all followers.
-				rf.sendHeartbeat()
+				rf.broadcastAppend()
 			}
 		case state == CANDIDATE:
 			select {
 			case <-rf.toFollowerCh:
 				DPrintf("[%d] Server %d from candidate to follower", rf.currentTerm, rf.me)
 			case <-rf.toLeaderCh:
-				rf.mu.Lock()
 				rf.toLeader()
-				rf.mu.Unlock()
-				rf.sendHeartbeat()
+				rf.broadcastAppend()
 			case <-time.After(rf.electionTimeout):
 				rf.startElection(CANDIDATE)
 			}
@@ -433,7 +441,7 @@ func (rf *Raft) ticker() {
 		case state == FOLLOWER:
 			select {
 			case <-rf.grantVoteCh:
-			case <-rf.heartbeatCh:
+			case <-rf.appendCh:
 			case <-time.After(rf.electionTimeout):
 				rf.startElection(FOLLOWER)
 			}

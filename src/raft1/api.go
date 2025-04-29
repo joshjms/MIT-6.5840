@@ -31,3 +31,8 @@ type AppendEntriesReply struct {
 	Term    int
 	Success bool
 }
+
+type LogEntry struct {
+	Term    int
+	Command interface{}
+}
