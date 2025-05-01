@@ -199,11 +199,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	reply.Term = rf.currentTerm
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+
+	upToDate := (args.LastLogTerm > rf.logs[len(rf.logs)-1].Term) ||
+		(args.LastLogTerm == rf.logs[len(rf.logs)-1].Term && args.LastLogIndex >= len(rf.logs)-1)
+
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && upToDate {
 		// DPrintf("[%d] Server %d grants vote to server %d\n", rf.currentTerm, rf.me, args.CandidateId)
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		sendToChannel(rf.grantVoteCh)
+	} else {
+		// DPrintf("[%d] Server %d rejects vote to server %d\n", rf.currentTerm, rf.me, args.CandidateId)
+		reply.VoteGranted = false
 	}
 }
 
@@ -414,6 +421,8 @@ func (rf *Raft) broadcastAppend() {
 		reply  AppendEntriesReply
 	}
 
+	leaderId := rf.me
+
 	prevLogIndexes := make([]int, len(rf.peers))
 	for i := range rf.peers {
 		prevLogIndexes[i] = rf.nextIndex[i] - 1
@@ -425,6 +434,7 @@ func (rf *Raft) broadcastAppend() {
 	}
 
 	logs := rf.logs[:]
+	commitIndex := rf.commitIndex
 
 	appendChan := make(chan appendResult, len(rf.peers)-1)
 
@@ -433,11 +443,11 @@ func (rf *Raft) broadcastAppend() {
 			go func(server int) {
 				args := AppendEntriesArgs{
 					Term:         term,
-					LeaderId:     rf.me,
+					LeaderId:     leaderId,
 					PrevLogIndex: prevLogIndexes[server],
 					PrevLogTerm:  prevLogTerms[server],
 					Entries:      logs[prevLogIndexes[server]+1:],
-					LeaderCommit: rf.commitIndex,
+					LeaderCommit: commitIndex,
 				}
 
 				reply := AppendEntriesReply{}
@@ -513,8 +523,8 @@ func (rf *Raft) applier() {
 
 func (rf *Raft) ticker() {
 	for !rf.killed() {
-		rf.electionTimeout = time.Duration(1000+rand.Intn(500)) * time.Millisecond
-		heartbeatInterval := time.Duration(20) * time.Millisecond
+		rf.electionTimeout = time.Duration(500+rand.Intn(500)) * time.Millisecond
+		heartbeatInterval := time.Duration(50) * time.Millisecond
 
 		rf.mu.Lock()
 		state := rf.state
