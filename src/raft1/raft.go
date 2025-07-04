@@ -74,17 +74,6 @@ func (rf *Raft) toFollowerWithTerm(term int) {
 	rf.currentTerm = term
 }
 
-func (rf *Raft) toCandidate() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if rf.state != Follower {
-		return
-	}
-
-	rf.state = Candidate
-}
-
 func (rf *Raft) toLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -179,13 +168,25 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	isLeader := rf.state == Leader
 
-	// Your code here (3B).
+	if !isLeader {
+		return -1, rf.currentTerm, false
+	}
 
-	return index, term, isLeader
+	rf.DPrintf("Receive %v", command)
+
+	rf.log = append(rf.log, Entry{Term: rf.currentTerm, Command: command})
+	rf.matchIndex[rf.me] = len(rf.log) - 1
+	rf.nextIndex[rf.me] = len(rf.log)
+
+	index := len(rf.log) - 1
+
+	go rf.broadcastAppendEntries()
+
+	return index, rf.currentTerm, isLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -245,6 +246,30 @@ func (rf *Raft) ticker() {
 	}
 }
 
+func (rf *Raft) applier() {
+	for !rf.killed() {
+		rf.mu.Lock()
+
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			rf.DPrintf("Applying %v", rf.log[i].Command)
+
+			msg := raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[i].Command,
+				CommandIndex: i,
+			}
+
+			rf.applyCh <- msg
+
+			rf.lastApplied = i
+		}
+
+		rf.mu.Unlock()
+
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -278,11 +303,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.resetElectionTimerCh = make(chan struct{}, 1)
 
+	rf.applyCh = applyCh
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	// start applier goroutine
+	go rf.applier()
 
 	return rf
 }
