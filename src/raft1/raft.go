@@ -8,12 +8,15 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -72,6 +75,7 @@ func (rf *Raft) toFollowerWithTerm(term int) {
 	rf.state = Follower
 	rf.votedFor = -1
 	rf.currentTerm = term
+	rf.persist()
 }
 
 func (rf *Raft) toLeader() {
@@ -117,6 +121,16 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -137,6 +151,29 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var term int
+	var votedFor int
+	var logEntries []Entry
+
+	if err := d.Decode(&term); err != nil {
+		log.Fatalf("error decoding term: %v", err)
+	}
+
+	if err := d.Decode(&votedFor); err != nil {
+		log.Fatalf("error decoding votedFor: %v", err)
+	}
+
+	if err := d.Decode(&logEntries); err != nil {
+		log.Fatalf("error decoding log: %v", err)
+	}
+
+	rf.currentTerm = term
+	rf.votedFor = votedFor
+	rf.log = logEntries
 }
 
 // how many bytes in Raft's persisted log?
@@ -179,6 +216,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.DPrintf("Receive %v", command)
 
 	rf.log = append(rf.log, Entry{Term: rf.currentTerm, Command: command})
+	rf.persist()
 	rf.matchIndex[rf.me] = len(rf.log) - 1
 	rf.nextIndex[rf.me] = len(rf.log)
 

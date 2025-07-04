@@ -12,6 +12,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	XTerm  int
+	XIndex int
+	XLen   int
 }
 
 type appendEntriesResult struct {
@@ -51,7 +55,45 @@ func (rf *Raft) broadcastAppendEntries() {
 			rf.nextIndex[res.server] = res.prevLogIndex + res.entriesLen + 1
 			rf.matchIndex[res.server] = res.prevLogIndex + res.entriesLen
 		} else {
-			rf.nextIndex[res.server]--
+			// If desired, the protocol can be optimized to reduce the
+			// number of rejected AppendEntries RPCs. For example,
+			// when rejecting an AppendEntries request, the follower
+			// can include the term of the conflicting entry and the first
+			// index it stores for that term. With this information, the
+			// leader can decrement nextIndex to bypass all of the con-
+			// flicting entries in that term; one AppendEntries RPC will
+			// be required for each term with conflicting entries, rather
+			// than one RPC per entry. In practice, we doubt this opti-
+			// mization is necessary, since failures happen infrequently
+			// and it is unlikely that there will be many inconsistent en-
+			// tries.
+
+			// Case 1: leader doesn't have XTerm:
+			//     nextIndex = XIndex
+			// Case 2: leader has XTerm:
+			//     nextIndex = (index of leader's last entry for XTerm) + 1
+			// Case 3: follower's log is too short:
+			//     nextIndex = XLen
+
+			if reply.XTerm >= 0 {
+				idx := -1
+				for i := len(rf.log) - 1; i >= 1; i-- {
+					if rf.log[i].Term == reply.XTerm {
+						idx = i
+						break
+					}
+				}
+				if idx != -1 {
+					// Case 2
+					rf.nextIndex[res.server] = idx + 1
+				} else {
+					// Case 1
+					rf.nextIndex[res.server] = reply.XIndex
+				}
+			} else {
+				// Case 3
+				rf.nextIndex[res.server] = reply.XLen
+			}
 		}
 
 		rf.DPrintf("%v-%v", rf.commitIndex+1, len(rf.log)-1)
@@ -166,9 +208,25 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 2. Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm.
 
-	if len(rf.log)-1 < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if len(rf.log)-1 < args.PrevLogIndex {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		reply.XTerm = -1
+		reply.XLen = len(rf.log)
+
+		return
+	}
+
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		i := args.PrevLogIndex
+		for i > 1 && rf.log[i-1].Term == rf.log[args.PrevLogIndex].Term {
+			i--
+		}
+		reply.XIndex = i
+
 		return
 	}
 
@@ -191,6 +249,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 4. Append any new entries not already in the log
 
 	rf.log = append(rf.log, args.Entries[entriesIndex:]...)
+	rf.persist()
 
 	rf.DPrintf("New logs: %v", rf.log)
 

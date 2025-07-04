@@ -35,6 +35,7 @@ func (rf *Raft) startElection(state State, term int) {
 
 	// 2. Vote for self.
 	rf.votedFor = rf.me
+	rf.persist()
 
 	// 3. Reset election timer.
 	rf.resetElectionTimer()
@@ -49,7 +50,7 @@ func (rf *Raft) startElection(state State, term int) {
 	voteCount := rf.waitRequestVoteReplies(requestVoteCh)
 	rf.DPrintf("vote count: %d", voteCount)
 
-	if voteCount >= (len(rf.peers)+1)/2 {
+	if voteCount > len(rf.peers)/2 {
 		rf.DPrintf("Become leader")
 
 		rf.toLeader()
@@ -58,6 +59,7 @@ func (rf *Raft) startElection(state State, term int) {
 		// Lose the election
 		rf.mu.Lock()
 		rf.votedFor = -1
+		rf.persist()
 		rf.resetElectionTimer()
 		rf.mu.Unlock()
 	}
@@ -176,6 +178,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && upToDate {
 		rf.votedFor = args.CandidateId
+		rf.persist()
+
 		reply.VoteGranted = true
 		rf.resetElectionTimer()
 		rf.DPrintf("Vote for %d", args.CandidateId)
