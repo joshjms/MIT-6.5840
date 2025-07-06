@@ -2,6 +2,7 @@ package raft
 
 import (
 	"fmt"
+
 	//log
 	"math/rand"
 	"sync"

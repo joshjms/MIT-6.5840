@@ -9,6 +9,7 @@ package raft
 import (
 	//	"bytes"
 	"bytes"
+	"fmt"
 	"log"
 	"math/rand"
 	"sync"
@@ -57,6 +58,9 @@ type Raft struct {
 	resetElectionTimerCh chan struct{}
 
 	applyCh chan raftapi.ApplyMsg
+
+	lastSnapshotIndex int
+	snapshot          []byte
 }
 
 type Entry struct {
@@ -89,10 +93,29 @@ func (rf *Raft) toLeader() {
 	rf.state = Leader
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
-
 	for i := range rf.peers {
-		rf.nextIndex[i] = len(rf.log)
+		rf.nextIndex[i] = rf.absIndex(len(rf.log))
 		rf.matchIndex[i] = 0
+	}
+}
+
+// sliceIndex takes an absolute index and converts it to the index in the server's log
+func (rf *Raft) sliceIndex(i int) int {
+	return i - rf.lastSnapshotIndex
+}
+
+// absIndex takes an index relative to the start of the log and converts it to the actual index of all
+func (rf *Raft) absIndex(i int) int {
+	return i + rf.lastSnapshotIndex
+}
+
+func (rf *Raft) printLog() {
+	if Debug {
+		for i := range rf.log {
+			fmt.Printf("%d ", rf.absIndex(i))
+		}
+
+		fmt.Println()
 	}
 }
 
@@ -128,9 +151,10 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.lastSnapshotIndex)
 
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.snapshot)
 }
 
 // restore previously persisted state.
@@ -158,6 +182,7 @@ func (rf *Raft) readPersist(data []byte) {
 	var term int
 	var votedFor int
 	var logEntries []Entry
+	var lastSnapshotIndex int
 
 	if err := d.Decode(&term); err != nil {
 		log.Fatalf("error decoding term: %v", err)
@@ -171,9 +196,18 @@ func (rf *Raft) readPersist(data []byte) {
 		log.Fatalf("error decoding log: %v", err)
 	}
 
+	if err := d.Decode(&lastSnapshotIndex); err != nil {
+		log.Fatalf("error decoding lastSnapshotIndex: %v", err)
+	}
+
 	rf.currentTerm = term
 	rf.votedFor = votedFor
 	rf.log = logEntries
+	rf.lastSnapshotIndex = lastSnapshotIndex
+	rf.commitIndex = lastSnapshotIndex
+	rf.lastApplied = lastSnapshotIndex
+
+	rf.snapshot = rf.persister.ReadSnapshot()
 }
 
 // how many bytes in Raft's persisted log?
@@ -189,7 +223,21 @@ func (rf *Raft) PersistBytes() int {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if rf.lastSnapshotIndex >= index || index > rf.lastApplied {
+		return
+	}
+
+	indexSlice := rf.sliceIndex(index)
+
+	rf.log = append([]Entry{{Term: rf.log[indexSlice].Term}}, rf.log[indexSlice+1:]...)
+	rf.lastSnapshotIndex = index
+
+	rf.snapshot = snapshot
+
+	rf.persist()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -213,18 +261,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, rf.currentTerm, false
 	}
 
-	rf.DPrintf("Receive %v", command)
-
 	rf.log = append(rf.log, Entry{Term: rf.currentTerm, Command: command})
 	rf.persist()
-	rf.matchIndex[rf.me] = len(rf.log) - 1
-	rf.nextIndex[rf.me] = len(rf.log)
-
 	index := len(rf.log) - 1
+
+	rf.matchIndex[rf.me] = rf.absIndex(index)
+	rf.nextIndex[rf.me] = rf.matchIndex[rf.me] + 1
 
 	go rf.broadcastAppendEntries()
 
-	return index, rf.currentTerm, isLeader
+	return rf.absIndex(index), rf.currentTerm, isLeader
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -277,7 +323,7 @@ func (rf *Raft) ticker() {
 			<-time.After(heartbeatTimeout)
 			go rf.broadcastAppendEntries()
 		default:
-			rf.DPrintf("Invalid state, got: %v", state)
+			panic("invalid state")
 		}
 
 		time.Sleep(5 * time.Millisecond)
@@ -288,21 +334,27 @@ func (rf *Raft) applier() {
 	for !rf.killed() {
 		rf.mu.Lock()
 
+		var applyMsgs []raftapi.ApplyMsg
+
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-			rf.DPrintf("Applying %v", rf.log[i].Command)
+			iSlice := rf.sliceIndex(i)
 
 			msg := raftapi.ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[i].Command,
+				Command:      rf.log[iSlice].Command,
 				CommandIndex: i,
 			}
 
-			rf.applyCh <- msg
+			applyMsgs = append(applyMsgs, msg)
 
 			rf.lastApplied = i
 		}
 
 		rf.mu.Unlock()
+
+		for _, msg := range applyMsgs {
+			rf.applyCh <- msg
+		}
 
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -342,6 +394,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.resetElectionTimerCh = make(chan struct{}, 1)
 
 	rf.applyCh = applyCh
+
+	rf.lastSnapshotIndex = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

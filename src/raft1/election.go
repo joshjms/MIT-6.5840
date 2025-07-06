@@ -21,8 +21,6 @@ type RequestVoteReply struct {
 func (rf *Raft) startElection(state State, term int) {
 	rf.mu.Lock()
 
-	rf.DPrintf("Starting election with term: %d, state: %d", term, state)
-
 	if rf.state != state || rf.currentTerm != term {
 		rf.mu.Unlock()
 		return
@@ -48,11 +46,8 @@ func (rf *Raft) startElection(state State, term int) {
 	rf.sendRequestVoteAll(requestVoteCh)
 
 	voteCount := rf.waitRequestVoteReplies(requestVoteCh)
-	rf.DPrintf("vote count: %d", voteCount)
 
 	if voteCount > len(rf.peers)/2 {
-		rf.DPrintf("Become leader")
-
 		rf.toLeader()
 		go rf.broadcastAppendEntries()
 	} else {
@@ -81,7 +76,6 @@ func (rf *Raft) sendRequestVoteAll(requestVoteCh chan *RequestVoteReply) {
 		}
 
 		go func(server int) {
-			rf.DPrintf("Sending RequestVote RPC to %d", server)
 			reply := &RequestVoteReply{}
 			rf.sendRequestVote(server, args, reply)
 
@@ -155,12 +149,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.DPrintf("Receive RequestVote RPC from %d", args.CandidateId)
-
 	// 1. Reply false if term < currentTerm.
 	if args.Term < rf.currentTerm {
-		rf.DPrintf("Reject %d: term < currentTerm", args.CandidateId)
-
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
@@ -182,12 +172,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		reply.VoteGranted = true
 		rf.resetElectionTimer()
-		rf.DPrintf("Vote for %d", args.CandidateId)
 
 		return
 	}
-
-	rf.DPrintf("Reject %d, upToDate: %v", args.CandidateId, upToDate)
 
 	reply.VoteGranted = false
 }
